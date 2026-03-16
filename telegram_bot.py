@@ -33,7 +33,6 @@ import socket
 import logging
 import asyncio
 import argparse
-import daemon
 from datetime import datetime
 from pathlib import Path
 
@@ -202,11 +201,42 @@ def load_temp_password():
     return pw if pw else None
 
 
-def next_sub_revision():
-    """Return next available sub-1000 revision (continues audit sequence downward)."""
+def sanitize_query(raw):
+    """
+    Sanitize user input for device lookup.
+    Strips non-printable/non-ASCII characters first, then:
+    - IP address (digits and dots only) — keep only 0-9 and .
+    - Hostname — keep only A-Za-z0-9 and -
+    Returns (sanitized_string, error_message_or_None).
+    """
+    import re
+    # Strip whitespace and non-printable/non-ASCII characters first
+    raw = re.sub(r'[^\x20-\x7E]', '', raw).strip()
+    # Decide: if remaining chars are all digits and dots treat as IP, else hostname
+    if re.match(r'^[\d.]+$', raw):
+        sanitized = re.sub(r'[^0-9.]', '', raw)
+    else:
+        sanitized = re.sub(r'[^A-Za-z0-9\-.]', '', raw)
+    if not sanitized:
+        return None, "Invalid input — provide a valid IP address or hostname."
+    return sanitized, None
+
+
+def get_or_create_temp_revision(temp_pw):
+    """
+    Return existing revision number if temp_pw is already in passwords.db,
+    otherwise assign the next sub-1000 revision and record it.
+    """
     passwords = load_passwords_db()
-    sub_revs  = [r for r in passwords if r < 1000]
-    return min(sub_revs) - 1 if sub_revs else 999
+    # Check if this exact password already has a revision
+    for revision, pw in passwords.items():
+        if pw == temp_pw:
+            return revision
+    # Not found — create new sub-1000 revision
+    sub_revs = [r for r in passwords if r < 1000]
+    revision = min(sub_revs) - 1 if sub_revs else 999
+    save_passwords_entry(revision, temp_pw)
+    return revision
 
 
 def save_passwords_entry(revision, password):
@@ -463,7 +493,12 @@ async def cmd_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    query = context.args[0].strip()
+    query_raw = context.args[0]
+    query, err = sanitize_query(query_raw)
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
+
     ip, hostname, result = lookup_device(query)
 
     if ip is None:
@@ -487,9 +522,8 @@ async def cmd_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if success:
-            # Record new temp revision in both DBs
-            revision = next_sub_revision()
-            save_passwords_entry(revision, temp_pw)
+            # Reuse existing revision if temp password already recorded, else create new
+            revision = get_or_create_temp_revision(temp_pw)
             save_device_revision(ip, hostname, revision)
 
             await update.message.reply_text(
@@ -690,6 +724,4 @@ def main():
 
 
 if __name__ == "__main__":
-  with daemon.DaemonContext():
     main()
-
